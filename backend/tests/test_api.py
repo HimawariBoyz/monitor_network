@@ -126,3 +126,22 @@ def test_metrics_history(client, viewer):
     dev = device_id(client, viewer, "SRV-SCADA-01")
     data = client.get(f"/api/devices/{dev}/metrics", params={"minutes": 60}, headers=viewer).json()
     assert len(data["series"]["latency_ms"]) > 5
+
+
+def test_empty_text_fields_round_trip(client, admin):
+    # Oracle stores '' as NULL; optional text must still read back as "".
+    body = {"name": "SW-EMPTY-01", "hostname": "sw-empty-01", "ip_address": "10.9.9.9",
+            "device_type": "switch", "zone": "Zone Z"}
+    created = client.post("/api/devices", json=body, headers=admin)
+    assert created.status_code == 201, created.text
+    d = client.get(f"/api/devices/{created.json()['id']}", headers=admin).json()
+    assert d["vendor"] == "" and d["description"] == "" and d["group_name"] == ""
+    assert client.delete(f"/api/devices/{d['id']}", headers=admin).status_code == 204
+
+
+def test_prune_metrics(client):
+    from app.models import utcnow
+    from app.worker import prune_metrics
+
+    with SessionLocal() as db:
+        assert prune_metrics(db, utcnow() + timedelta(days=365)) > 0

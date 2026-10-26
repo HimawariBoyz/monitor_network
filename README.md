@@ -64,7 +64,7 @@ Rule ที่อิง Metric จะไม่ประเมินขณะอ�
 - **Backend:** Python FastAPI + SQLAlchemy (`backend/app/`)
 - **Worker:** `python -m app.worker` ทุก 5 วินาที: สร้างข้อมูลจำลอง → ingest → อัปเดตสถานะ → ประเมิน Rule → เปิด/ปิด Alert
   ข้อมูลจำลองมีรูปแบบเดียวกับผลจาก ICMP/SNMP จริง ทำให้ Phase 3 เพิ่ม Collector จริงเข้าทางเดียวกันได้ (`ingest_sample()`)
-- **Database:** `device_metrics` เป็น TimescaleDB hypertable มี retention policy (ค่าเริ่มต้น 7 วัน)
+- **Database:** PostgreSQL + TimescaleDB (`device_metrics` เป็น hypertable มี retention policy 7 วัน) หรือ Oracle ที่ติดตั้งในเครื่อง (ดูหัวข้อด้านล่าง)
 - **Demo Control** เขียนได้แค่ตาราง `simulation_state` ของอุปกรณ์ที่ `source=simulation` เท่านั้น (Safety Boundary ตาม Roadmap)
 
 ## วิธีรัน (Docker Compose)
@@ -72,7 +72,7 @@ Rule ที่อิง Metric จะไม่ประเมินขณะอ�
 ต้องมี Docker Desktop หรือ Docker Engine + Compose v2
 
 ```bash
-git clone https://gitlab.com/personal201244/monitor_network.git
+git clone https://github.com/HimawariBoyz/monitor_network.git
 cd monitor_network
 cp .env.example .env          # ไม่บังคับ ถ้าไม่มีจะใช้ค่าเริ่มต้น
 docker compose up -d --build
@@ -99,6 +99,32 @@ docker compose down -v            # หยุดและลบข้อมู�
 ```
 
 API docs (Swagger) อยู่ที่ <http://localhost:8080/api/docs> (กด Authorize แล้วใส่ token จาก `POST /api/auth/login`)
+
+## ใช้ Oracle ที่ติดตั้งในเครื่องแทน PostgreSQL
+
+ระบบรองรับ Oracle 12.2 ขึ้นไป (ทดสอบกับ Oracle XE 21c) ผ่าน `python-oracledb` แบบ thin mode จึงไม่ต้องลง Oracle Client
+ใช้ไฟล์ `docker-compose.oracle.yml` ซึ่งไม่มี container ฐานข้อมูล แต่ให้ `api` และ `worker` ต่อไปที่ Oracle บนเครื่องผ่าน `host.docker.internal`
+
+1. หา service name ของ PDB: เปิด Command Prompt แล้วพิมพ์ `lsnrctl status` ดูบรรทัด `Service "..."`
+   ปกติคือ `XEPDB1` (XE 18c/21c), `FREEPDB1` (Oracle Database 23ai Free) หรือ `ORCLPDB` (ติดตั้งแบบ Enterprise)
+2. สร้างผู้ใช้สำหรับระบบ (เปลี่ยนรหัสผ่านใน `oracle/create_user.sql` ได้)
+
+   ```bat
+   cd monitor_network
+   sqlplus sys/<รหัส SYS ตอนติดตั้ง>@localhost:1521/XEPDB1 as sysdba @oracle\create_user.sql
+   ```
+
+3. คัดลอก `.env.example` เป็น `.env` แล้วแก้ `ORACLE_USER`, `ORACLE_PASSWORD`, `ORACLE_PORT`, `ORACLE_SERVICE` ให้ตรงกับเครื่อง
+4. รัน
+
+   ```bash
+   docker compose -f docker-compose.oracle.yml up -d --build
+   docker compose -f docker-compose.oracle.yml logs -f api worker
+   ```
+
+ครั้งแรกระบบจะสร้างตารางและข้อมูล Demo ใน schema ของผู้ใช้นั้นเอง ถ้าต่อไม่ได้ (`DPY-6005`, `ORA-12514`)
+ให้ตรวจ service name, พอร์ต และ Windows Firewall ว่าอนุญาตพอร์ต 1521
+บน Oracle ไม่มี TimescaleDB จึงให้ worker ลบ Metrics ที่เก่ากว่า `METRICS_RETENTION_DAYS` ทุกชั่วโมงแทน
 
 ## สคริปต์ Demo แนะนำ (ประมาณ 5 นาที)
 
@@ -127,7 +153,8 @@ uvicorn app.main:app --reload          # API ที่ :8000
 python -m app.worker                   # อีก terminal: simulation + rule engine
 ```
 
-ถ้าไม่มี TimescaleDB ระบบจะใช้ PostgreSQL ธรรมดาได้ (ใช้ `date_bin` แทน `time_bucket`)
+ถ้าไม่มี TimescaleDB ระบบจะใช้ PostgreSQL ธรรมดาได้ หรือใช้ Oracle โดยตั้ง
+`DATABASE_URL=oracle+oracledb://monitor:monitor@localhost:1521/?service_name=XEPDB1`
 
 Frontend (Node 20+)
 
@@ -143,6 +170,12 @@ npx ng serve --proxy-config proxy.conf.json   # http://localhost:4200, ส่ง
 docker run -d --name tsdb-test -p 5433:5432 -e POSTGRES_USER=monitor \
   -e POSTGRES_PASSWORD=monitor -e POSTGRES_DB=monitor timescale/timescaledb:2.17.2-pg16
 cd backend && pytest -q
+```
+
+ทดสอบกับ Oracle: ตั้ง `TEST_ORACLE_DATABASE_URL` เป็น schema ที่ลบข้อมูลได้ (เทสต์จะลบตารางก่อนเริ่ม)
+
+```bash
+TEST_ORACLE_DATABASE_URL='oracle+oracledb://monitor:monitor@localhost:1521/?service_name=XEPDB1' pytest -q
 ```
 
 ทดสอบ: Login/สิทธิ์ตาม Role, วงจร Normal → Offline → Alert → Ack → Recovery, Alert จาก Metric (Latency),
@@ -166,7 +199,9 @@ frontend/
     pages/               dashboard, devices, device-detail, alerts, rules, demo, audit, login
     core/                api/auth services, guards, models, polling
     shared/              chips, pipes, ack dialog, chart helpers
-docker-compose.yml
+docker-compose.yml          PostgreSQL/TimescaleDB ใน container
+docker-compose.oracle.yml   ใช้ Oracle ที่ติดตั้งในเครื่อง
+oracle/create_user.sql      สร้างผู้ใช้ Oracle ให้ระบบ
 ```
 
 ## Environment variables
@@ -178,7 +213,10 @@ docker-compose.yml
 | `JWT_SECRET` | change-me-in-production | กุญแจเซ็น Token (ต้องเปลี่ยน) |
 | `SIM_INTERVAL_SECONDS` | 5 | รอบการสร้างข้อมูลจำลอง |
 | `STALE_AFTER_SECONDS` | 20 | ไม่มีข้อมูลนานเกินนี้ถือว่า Unknown |
-| `METRICS_RETENTION_DAYS` | 7 | อายุการเก็บ Metrics (TimescaleDB retention) |
+| `METRICS_RETENTION_DAYS` | 7 | อายุการเก็บ Metrics (TimescaleDB retention หรือ worker ลบเองบน Oracle) |
+| `ORACLE_USER` / `ORACLE_PASSWORD` | monitor | บัญชี Oracle (เฉพาะ `docker-compose.oracle.yml`) |
+| `ORACLE_HOST` / `ORACLE_PORT` | host.docker.internal / 1521 | ที่อยู่ Oracle listener |
+| `ORACLE_SERVICE` | XEPDB1 | service name ของ PDB |
 
 ## ขั้นต่อไป (ตาม Roadmap)
 

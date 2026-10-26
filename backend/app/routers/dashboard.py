@@ -2,14 +2,14 @@ from collections import Counter, defaultdict
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from .. import config
 from .. import db as dbmod
 from ..db import get_db
 from ..engine.pipeline import effective_state
-from ..models import Alert, AuditLog, Device, Heartbeat, User, utcnow
+from ..models import Alert, AuditLog, Device, Heartbeat, User, UTCDateTime, utcnow
 from ..security import current_user
 from ..serializers import alert_out
 
@@ -38,21 +38,18 @@ def summary(db: Session = Depends(get_db), _: User = Depends(current_user)):
     beat = db.get(Heartbeat, "simulation")
     beat_age = (now - beat.last_beat).total_seconds() if beat else None
 
-    bucket = (
-        "time_bucket(INTERVAL '1 minute', collected_at)" if dbmod.HAS_TIMESCALE
-        else "date_bin(INTERVAL '1 minute', collected_at, TIMESTAMPTZ '2000-01-01')"
-    )
     trend = db.execute(
         text(
-            f"SELECT {bucket} AS ts, metric_key, avg(value) FROM device_metrics "
-            "WHERE collected_at >= :since AND metric_key IN ('latency_ms', 'packet_loss_pct') "
-            "GROUP BY ts, metric_key ORDER BY ts"
-        ),
-        {"since": now - timedelta(minutes=60)},
+            "SELECT ts, metric_key, avg(value) FROM ("
+            f"SELECT {dbmod.bucket_epoch_sql()} AS ts, metric_key, value FROM device_metrics "
+            "WHERE collected_at >= :since AND metric_key IN ('latency_ms', 'packet_loss_pct')"
+            ") m GROUP BY ts, metric_key ORDER BY ts"
+        ).bindparams(bindparam("since", type_=UTCDateTime())),
+        {"bucket": 60, "since": now - timedelta(minutes=60)},
     ).all()
     trend_series: dict[str, list] = defaultdict(list)
     for ts, key, value in trend:
-        trend_series[key].append([ts.isoformat(), round(value, 2)])
+        trend_series[key].append([dbmod.epoch_to_dt(ts).isoformat(), round(float(value), 2)])
 
     return {
         "generated_at": now,
