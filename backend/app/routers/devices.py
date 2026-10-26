@@ -3,13 +3,13 @@ from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
-from sqlalchemy import func, text
+from sqlalchemy import bindparam, func, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
 from .. import db as dbmod
 from ..db import get_db
-from ..models import Alert, Device, DeviceStatus, SimulationState, User, utcnow
+from ..models import Alert, Device, DeviceStatus, SimulationState, User, UTCDateTime, utcnow
 from ..security import audit, current_user, require_role
 from ..serializers import alert_out, device_out
 
@@ -104,23 +104,19 @@ def device_metrics(
 ):
     _get_device(db, device_id)
     bucket_seconds = max(10, minutes * 60 // 240)
-    bucket = (
-        "time_bucket(make_interval(secs => :bucket), collected_at)"
-        if dbmod.HAS_TIMESCALE
-        else "date_bin(make_interval(secs => :bucket), collected_at, TIMESTAMPTZ '2000-01-01')"
-    )
     rows = db.execute(
         text(
-            f"SELECT {bucket} AS ts, metric_key, avg(value) AS value "
-            "FROM device_metrics WHERE device_id = :device_id AND collected_at >= :since "
-            "GROUP BY ts, metric_key ORDER BY ts"
-        ),
+            "SELECT ts, metric_key, avg(value) FROM ("
+            f"SELECT {dbmod.bucket_epoch_sql()} AS ts, metric_key, value FROM device_metrics "
+            "WHERE device_id = :device_id AND collected_at >= :since"
+            ") m GROUP BY ts, metric_key ORDER BY ts"
+        ).bindparams(bindparam("since", type_=UTCDateTime())),
         {"bucket": bucket_seconds, "device_id": device_id,
          "since": utcnow() - timedelta(minutes=minutes)},
     ).all()
     series: dict[str, list] = defaultdict(list)
     for ts, key, value in rows:
-        series[key].append([ts.isoformat(), round(value, 2)])
+        series[key].append([dbmod.epoch_to_dt(ts).isoformat(), round(float(value), 2)])
     return {"bucket_seconds": bucket_seconds, "series": series}
 
 

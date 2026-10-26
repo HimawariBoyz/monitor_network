@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timezone
 
 from sqlalchemy import (
@@ -6,11 +7,14 @@ from sqlalchemy import (
     DateTime,
     Float,
     ForeignKey,
+    Identity,
     Integer,
     String,
     Text,
 )
+from sqlalchemy.dialects import oracle
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import TypeDecorator
 
 from .db import Base
 
@@ -19,7 +23,73 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
-TS = DateTime(timezone=True)
+class UTCDateTime(TypeDecorator):
+    """Aware UTC datetimes on every database.
+
+    PostgreSQL: TIMESTAMPTZ. Oracle: plain TIMESTAMP holding UTC, because the
+    SQLAlchemy DateTime there is a DATE (no fractions) and python-oracledb drops
+    the zone of TIMESTAMP WITH TIME ZONE values.
+    """
+
+    impl = DateTime
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "oracle":
+            return dialect.type_descriptor(oracle.TIMESTAMP())
+        return dialect.type_descriptor(DateTime(timezone=True))
+
+    def process_bind_param(self, value, dialect):
+        if value is not None and dialect.name == "oracle" and value.tzinfo is not None:
+            value = value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if value is not None and value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value
+
+
+class PortableJSON(TypeDecorator):
+    """JSON on PostgreSQL; JSON text in a VARCHAR2 on Oracle."""
+
+    impl = String
+    cache_ok = True
+
+    def load_dialect_impl(self, dialect):
+        if dialect.name == "oracle":
+            return dialect.type_descriptor(String(4000))
+        return dialect.type_descriptor(JSON())
+
+    def process_bind_param(self, value, dialect):
+        if dialect.name == "oracle" and value is not None:
+            return json.dumps(value)
+        return value
+
+    def process_result_value(self, value, dialect):
+        if dialect.name == "oracle" and value is not None:
+            return json.loads(value)
+        return value
+
+
+class OptString(TypeDecorator):
+    """Optional text that reads back as "" instead of None.
+
+    Oracle stores '' as NULL, so these columns are nullable and NULL means empty.
+    """
+
+    impl = String
+    cache_ok = True
+
+    def process_result_value(self, value, dialect):
+        return "" if value is None else value
+
+
+class OptText(OptString):
+    impl = Text
+
+
+TS = UTCDateTime()
 
 # Device states. Offline = we checked and it did not answer.
 # Unknown = we have no fresh data (collector problem / stale), so we can't tell.
@@ -30,7 +100,7 @@ ROLES = ("viewer", "engineer", "admin")
 
 class User(Base):
     __tablename__ = "users"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     username: Mapped[str] = mapped_column(String(64), unique=True)
     full_name: Mapped[str] = mapped_column(String(128))
     password_hash: Mapped[str] = mapped_column(String(256))
@@ -41,16 +111,16 @@ class User(Base):
 
 class Device(Base):
     __tablename__ = "devices"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     name: Mapped[str] = mapped_column(String(64), unique=True)
     hostname: Mapped[str] = mapped_column(String(128))
     ip_address: Mapped[str] = mapped_column(String(64))
     device_type: Mapped[str] = mapped_column(String(32))  # switch/router/firewall/server
-    vendor: Mapped[str] = mapped_column(String(64))
-    model: Mapped[str] = mapped_column(String(64))
+    vendor: Mapped[str] = mapped_column(OptString(64), nullable=True)
+    model: Mapped[str] = mapped_column(OptString(64), nullable=True)
     zone: Mapped[str] = mapped_column(String(64))
-    group_name: Mapped[str] = mapped_column(String(64))
-    description: Mapped[str] = mapped_column(Text, default="")
+    group_name: Mapped[str] = mapped_column(OptString(64), nullable=True)
+    description: Mapped[str] = mapped_column(OptText, default="", nullable=True)
     monitoring_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     # "simulation" or "live". Phase 1 only has simulated devices.
     source: Mapped[str] = mapped_column(String(16), default="simulation")
@@ -71,7 +141,7 @@ class DeviceStatus(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     last_checked_at: Mapped[datetime | None] = mapped_column(TS, nullable=True)
     state_changed_at: Mapped[datetime] = mapped_column(TS, default=utcnow)
-    last_metrics: Mapped[dict] = mapped_column(JSON, default=dict)
+    last_metrics: Mapped[dict] = mapped_column(PortableJSON, default=dict)
     source: Mapped[str] = mapped_column(String(16), default="simulation")
 
     device: Mapped[Device] = relationship(back_populates="status")
@@ -87,7 +157,7 @@ class DeviceMetric(Base):
     metric_key: Mapped[str] = mapped_column(String(32), primary_key=True)
     collected_at: Mapped[datetime] = mapped_column(TS, primary_key=True)
     value: Mapped[float] = mapped_column(Float)
-    unit: Mapped[str] = mapped_column(String(16))
+    unit: Mapped[str] = mapped_column(OptString(16), nullable=True)
     source: Mapped[str] = mapped_column(String(16), default="simulation")
 
 
@@ -108,7 +178,7 @@ class SimulationState(Base):
 
 class AlertRule(Base):
     __tablename__ = "alert_rules"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     key: Mapped[str] = mapped_column(String(32), unique=True)
     name: Mapped[str] = mapped_column(String(128))
     # metric_key from device_metrics, or "state" for device reachability
@@ -120,12 +190,12 @@ class AlertRule(Base):
     duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
     severity: Mapped[str] = mapped_column(String(16))  # critical/high/warning/info
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
-    description: Mapped[str] = mapped_column(Text, default="")
+    description: Mapped[str] = mapped_column(OptText, default="", nullable=True)
 
 
 class Alert(Base):
     __tablename__ = "alerts"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     device_id: Mapped[int] = mapped_column(ForeignKey("devices.id", ondelete="CASCADE"))
     rule_id: Mapped[int] = mapped_column(ForeignKey("alert_rules.id", ondelete="CASCADE"))
     severity: Mapped[str] = mapped_column(String(16))
@@ -145,12 +215,12 @@ class Alert(Base):
 
 class AuditLog(Base):
     __tablename__ = "audit_logs"
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
     at: Mapped[datetime] = mapped_column(TS, default=utcnow)
     username: Mapped[str] = mapped_column(String(64))
     action: Mapped[str] = mapped_column(String(64))
-    target: Mapped[str] = mapped_column(String(128))
-    detail: Mapped[str] = mapped_column(Text, default="")
+    target: Mapped[str] = mapped_column(OptString(128), nullable=True)
+    detail: Mapped[str] = mapped_column(OptText, default="", nullable=True)
 
 
 class Heartbeat(Base):

@@ -1,0 +1,36 @@
+# Run Factory NetMon against an Oracle database that is already running on this
+# computer (e.g. Oracle XE / Free installed on Windows), instead of the bundled
+# PostgreSQL/TimescaleDB container:
+#
+#   docker compose -f docker-compose.oracle.yml up -d --build
+#
+# Set ORACLE_* in .env (see .env.example). Containers reach the host's Oracle
+# listener through host.docker.internal.
+services:
+  api:
+    build: ./backend
+    environment: &backend-env
+      DATABASE_URL: oracle+oracledb://${ORACLE_USER:-monitor}:${ORACLE_PASSWORD:-monitor}@${ORACLE_HOST:-host.docker.internal}:${ORACLE_PORT:-1521}/?service_name=${ORACLE_SERVICE:-XEPDB1}
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      SIM_INTERVAL_SECONDS: ${SIM_INTERVAL_SECONDS:-5}
+      STALE_AFTER_SECONDS: ${STALE_AFTER_SECONDS:-20}
+      METRICS_RETENTION_DAYS: ${METRICS_RETENTION_DAYS:-7}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    environment: *backend-env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  web:
+    build: ./frontend
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+    restart: unless-stopped
